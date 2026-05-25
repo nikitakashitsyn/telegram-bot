@@ -1,0 +1,37 @@
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Local databases
+*.db
+*.sqlite3
+
+# JSON runtime data
+*.json
+!package-lock.json
+!composer.json
+
+# OS files
+.DS_Store
+Thumbs.db
