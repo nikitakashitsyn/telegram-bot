@@ -6,7 +6,7 @@ import time
 import random
 from decimal import Decimal, InvalidOperation
 import html
-import traceback  # <-- ТЕПЕРЬ ОН АКТИВЕН И ЯРОК! Используется в логировании ошибок.
+import traceback  # 
 import re
 
 import requests
@@ -46,8 +46,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Основная рабочая модель (ОБНОВИЛИ НА БЕСПЛАТНУЮ И УМНУЮ 2.5)
-GEMINI_MODEL_NAME = "gemini-2.5-flash"
+# Основная рабочая модель (ОБНОВИЛИ НА БЕСПЛАТНУЮ И УМНУЮ 1.5)
+GEMINI_MODEL_NAME = "gemini-3.5-flash"
 
 # Инициализация Google Gemini через НОВЫЙ SDK (ОБНОВЛЕНО)
 ai_client = None
@@ -185,43 +185,52 @@ async def edit_html_message(update: Update, text: str, reply_markup=None):
 # 🤖 АСИНХРОННОЕ ЯДРО ВЗАИМОДЕЙСТВИЯ С GEMINI API
 # --------------------------
 
-async def gemini_chat_request(contents: str, system_instruction: str = None, timeout: int = 200, retries: int = 2) -> str:
+async def gemini_chat_request(contents: str, system_instruction: str = None, timeout: int = 60) -> str:
     """
-    Асинхронный запрос к бесплатной Gemini 2.5 Flash через новый SDK.
+    Умный ИИ-запрос. 
+    УБРАН цикл retries, чтобы не конфликтовать со встроенным механизмом tenacity 
+    в SDK Google и не вызывать экспоненциальные баны (48+ сек).
     """
     if not ai_client:
         logger.error("Запрос отклонён: клиент Gemini не инициализирован.")
         return "Ошибка конфигурации ИИ."
 
-    loop = asyncio.get_running_loop()
+    # Динамически собираем конфиг
+    config_kwargs = {"temperature": 0.3}
+    if system_instruction:
+        config_kwargs["system_instruction"] = system_instruction
+        
+    config = types.GenerateContentConfig(**config_kwargs)
     
-    # Конфигурация системного промпта под новый стандарт
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        temperature=0.3
-    )
-    
-    for attempt in range(retries + 1):
-        try:
-            # Выполняем синхронный вызов SDK в асинхронном потоке executor
-            response = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    lambda: ai_client.models.generate_content(
-                        model=GEMINI_MODEL_NAME,
-                        contents=contents,
-                        config=config
-                    )
-                ),
-                timeout=timeout
-            )
-            return response.text if response.text else ""
-        except Exception as e:
-            tb_str = traceback.format_exc()
-            logger.warning(f"Сбой ИИ-запроса к Gemini (попытка {attempt + 1}/{retries + 1}): {e}\n{tb_str}")
-            if attempt == retries:
-                raise e
-            await asyncio.sleep(1.5)
+    try:
+        # Делаем ровно ОДИН запрос. Никакого спама серверов.
+        response = await asyncio.wait_for(
+            ai_client.aio.models.generate_content(
+                model=GEMINI_MODEL_NAME, 
+                contents=contents, 
+                config=config
+            ),
+            timeout=timeout
+        )
+        return response.text if response.text else ""
+        
+    except Exception as e:
+        err_str = str(e)
+        
+        # Читаем ошибку лимитов (429)
+        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            match = re.search(r'retry in (\d+(?:\.\d+)?)s', err_str)
+            wait_sec = int(float(match.group(1)) + 1.0) if match else 15
+            logger.warning(f"Лимит Google. Передаем юзеру паузу: {wait_sec} сек.")
+            raise ValueError(f"COOLDOWN:{wait_sec}")
+            
+        # Читаем ошибку перегрузки самого Гугла (503)
+        elif "503" in err_str or "UNAVAILABLE" in err_str:
+            logger.warning("Серверы Google перегружены (503).")
+            raise ValueError("OVERLOAD")
+            
+        logger.error(f"Неизвестная ошибка ИИ: {err_str}")
+        raise e
 
 
 # --------------------------
@@ -240,7 +249,7 @@ def load_tasks_from_excel(filepath: str) -> dict:
     try:
         xl_file = pd.ExcelFile(filepath)
         for sheet_name in xl_file.sheet_names:
-            df = pd.read_excel(filepath, sheet_name=sheet_name)
+            df = pd.read_excel(filepath, sheet_name=sheet_name, dtype={"id": str})
             
             # ФИКС БАГА: заменяем любые пропуски (NaN) в ячейках на пустые строки
             df = df.fillna("")
@@ -296,12 +305,12 @@ async def get_project_euler_problem_async(exclude_ids: list) -> dict:
     Загружает случайную уникальную задачу с официального сайта Project Euler,
     после чего отправляет условие в Gemini для перевода и красивой HTML верстки.
     """
-    problem_id = -1
-    # Подбираем случайный ID задачи, которую пользователь еще не решал в текущей сессии
-    for _ in range(50):
-        problem_id = random.randint(1, 150)
-        if str(problem_id) not in exclude_ids:
-            break
+    # Вычисляем доступные задачи через множества (исключает зависание цикла)
+    available_ids = list(set(range(1, 151)) - set(int(x) for x in exclude_ids if x.isdigit()))
+    if not available_ids:
+        logger.warning("Все доступные задачи Project Euler решены в этой сессии.")
+        return None
+    problem_id = random.choice(available_ids)
             
     url = f"https://projecteuler.net/problem={problem_id}"
     
@@ -356,8 +365,13 @@ async def get_project_euler_problem_async(exclude_ids: list) -> dict:
             ai_response = await gemini_chat_request(contents=user_content, system_instruction=system_prompt)
             translated_text = clean_ai_html(ai_response)
         except Exception as e:
-            logger.error(f"Ошибка ИИ-перевода для задачи #{problem_id}: {e}. Используем сырой английский текст.")
-            translated_text = f"<b>{original_title}</b>\n\n{raw_text}"
+            logger.error(f"Ошибка ИИ-перевода для задачи #{problem_id}: {e}")
+            # Если Гугл задушил лимитами, честно пишем об этом пользователю
+            translated_text = (
+                f"<b>{original_title}</b>\n\n"
+                f"{raw_text}\n\n"
+                f"<i>(⚠️ ИИ-переводчик временно недоступен из-за лимитов Google. Показан оригинальный текст.)</i>"
+            )
 
         task_text = (
             f"📐 <b>Project Euler — Задача №{problem_id}</b>\n\n"
@@ -382,15 +396,13 @@ async def get_project_euler_problem_async(exclude_ids: list) -> dict:
 
 def normalize_answer(answer_str: str) -> Decimal | str:
     """
-    Приводит строку ответа к единому стандарту.
-    Заменяет запятые на точки, убирает лишние нули в дробной части.
-    Если строка преобразуема в число — возвращает Decimal, иначе — строку в нижнем регистре.
+    Приводит строку ответа к единому стандарту, безопасно обрабатывая нули.
     """
     answer_str = str(answer_str).strip().replace(",", ".")
-    if "." in answer_str:
-        answer_str = answer_str.rstrip("0").rstrip(".")
     try:
-        return Decimal(answer_str)
+        d = Decimal(answer_str)
+        # Если число равно нулю, возвращаем его без нормализации (чтобы не убить нули после запятой)
+        return d.normalize() if d != 0 else Decimal("0")
     except InvalidOperation:
         return answer_str.lower()
 
@@ -678,12 +690,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "hint":
             await cleanup_messages(user_info, context)
             think_msg = await send_thinking(update, "🧠 <i>ИИ-Ментор формулирует наводящую подсказку...</i>")
-            user_info["msg_think"] = think_msg.message_id
+            if think_msg:
+                user_info["msg_think"] = think_msg.message_id
             
             prompt = (
                 "Ты — опытный преподаватель. Сформулируй наводящую подсказку к математической или IT задаче.\n"
                 "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать LaTeX (символы $). Вместо этого используй аккуратный Unicode (², ³, √, ≠).\n"
-                "Оформи ответ строго в HTML. Используй маркированные списки и жирный шрифт для ключевых концептов.\n"
+                "Оформи ответ для Telegram. ИСПОЛЬЗУЙ ТОЛЬКО теги <b>, <i>, <code>. \n"
+                "ЗАПРЕЩЕНО использовать теги <ul>, <ol>, <li>, <p>, <br>, <html>. Для списков используй обычный символ маркера (•).\n"
                 "Ни при каких обстоятельствах не давай финального ответа и не пиши готовый программный код. Студент должен додуматься сам."
             )
             user_content = f"Задача:\n{strip_html_tags(user_info['task']['task_text'])}"
@@ -696,8 +710,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 full_text = f"{user_info['task']['task_text']}\n\n💡 <b>Подсказка от ментора:</b>\n{hint_text}"
                 await edit_html_message(update, full_text, get_keyboard("task"))
             except Exception as e:
-                logger.error(f"Ошибка генерации подсказки: {e}")
-                await context.bot.send_message(user_info["chat_id"], "⚠️ Не удалось связаться с ИИ-модулем подсказок. Попробуйте еще раз.")
+                err_str = str(e)
+                logger.error(f"Ошибка генерации подсказки: {err_str}")
+                
+                if "COOLDOWN:" in err_str:
+                    wait_sec = err_str.split("COOLDOWN:")[1]
+                    err_text = f"⏳ <b>Анти-Спам Google.</b>\nВы исчерпали лимит бесплатных запросов. Пожалуйста, подождите ровно <b>{wait_sec} секунд</b>."
+                elif "OVERLOAD" in err_str:
+                    err_text = "⚠️ <b>Серверы Google сейчас перегружены.</b>\nСлишком много людей используют ИИ в данный момент. Подождите пару минут."
+                else:
+                    err_text = "⚠️ Не удалось связаться с ИИ. Попробуйте еще раз."
+                
+                sent_err = await context.bot.send_message(user_info["chat_id"], err_text, parse_mode="HTML")
+                user_info.setdefault("msg_errors", []).append(sent_err.message_id)
+                save_user_data(user_data)
             
             try:
                 await context.bot.delete_message(user_info["chat_id"], user_info["msg_think"])
@@ -709,11 +735,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "solution":
             await cleanup_messages(user_info, context)
             think_msg = await send_thinking(update, "🧠 <i>ИИ-Репетитор составляет подробный разбор задачи...</i>")
-            user_info["msg_think"] = think_msg.message_id
+            if think_msg:
+                user_info["msg_think"] = think_msg.message_id
             
             prompt = (
                 "Ты — составитель академического учебника. Напиши детальное, пошаговое решение задачи для книги.\n"
-                "Оформи структуру в HTML, разделяя этапы тегами <b>Шаг 1</b>, <b>Шаг 2</b>.\n"
+                "Оформи структуру строго для Telegram: разрешены ТОЛЬКО теги <b>, <i>, <code>. \n"
+                "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО выводить HTML-каркас (<!DOCTYPE>, <html>, <body>, <h1>, <h2>, <ul>, <li>).\n"
+                "Разделяй этапы жирным текстом (например, <b>Шаг 1</b>). Для списков используй символ (•).\n"
                 "Формулы и выражения обязательно помещай внутрь тегов <code>. Запрещено использовать LaTeX ($).\n"
                 "В самом конце обязательно выведи строчку: <b>Ответ: [значение]</b>."
             )
@@ -723,11 +752,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ai_response = await gemini_chat_request(contents=user_content, system_instruction=prompt, timeout=200)
                 sol_text = clean_ai_html(ai_response)
                 
-                await send_html_message(user_info["chat_id"], f"📝 <b>Официальный разбор решения:</b>\n\n{sol_text}", context=context)
+                # ИСПРАВЛЕНО: сохраняем message_id отправленного разбора
+                sent_sol = await send_html_message(user_info["chat_id"], f"📝 <b>Официальный разбор решения:</b>\n\n{sol_text}", context=context)
+                if sent_sol:
+                    user_info.setdefault("msg_answer", []).append(sent_sol.message_id)
+                    save_user_data(user_data) # Обязательно сохраняем состояние
+                
                 await query.edit_message_reply_markup(reply_markup=get_keyboard("next"))
             except Exception as e:
-                logger.error(f"Ошибка генерации разбора: {e}")
-                await context.bot.send_message(user_info["chat_id"], "⚠️ Не удалось сгенерировать разбор решения задачи.")
+                err_str = str(e)
+                logger.error(f"Ошибка генерации разбора: {err_str}")
+                
+                if "COOLDOWN:" in err_str:
+                    wait_sec = err_str.split("COOLDOWN:")[1]
+                    err_text = f"⏳ <b>Анти-Спам Google.</b>\nВы исчерпали лимит бесплатных запросов. Пожалуйста, подождите ровно <b>{wait_sec} секунд</b>."
+                elif "OVERLOAD" in err_str:
+                    err_text = "⚠️ <b>Серверы Google сейчас перегружены.</b>\nСлишком много людей используют ИИ в данный момент. Подождите пару минут."
+                else:
+                    err_text = "⚠️ Не удалось связаться с ИИ. Попробуйте еще раз."
+                
+                sent_err = await send_html_message(user_info["chat_id"], err_text, context=context)
+                if sent_err:
+                    user_info.setdefault("msg_errors", []).append(sent_err.message_id)
+                    save_user_data(user_data)
                 
             try:
                 await context.bot.delete_message(user_info["chat_id"], user_info["msg_think"])
@@ -791,7 +838,7 @@ async def start_task(update: Update, context: ContextTypes.DEFAULT_TYPE, query=N
         raw_task = random.choice(pool)
         formatted_text = (
             f"📚 <b>Раздел {user_info['class_course']} — Задача №{raw_task['id']}</b>\n\n"
-            f"{html.escape(raw_task['task_text'])}\n\n"
+            f"{raw_task['task_text']}\n\n"
             f"<i>Решите задачу на бумаге / в IDE и отправьте числовой ответ в чат.</i>"
         )
         task = {
@@ -820,8 +867,13 @@ async def process_check(user_id: int, update: Update, context: ContextTypes.DEFA
     think_msg = await send_thinking(update, "🔍 <i>Экспертная проверка вашего решения...</i>")
     
     if current_task["type"] == "euler":
-        # Асинхронная ИИ-валидация присланного кода решения через Gemini
-        is_correct, fail_reason = await check_code_with_ai(current_task["task_text"], user_ans)
+        # Эвристическая проверка: похоже ли присланное сообщение на код
+        if not any(c in user_ans for c in "={}()[]+-*/;") and len(user_ans.split()) < 3:
+            is_correct = False
+            fail_reason = "Для задач Project Euler требуется отправить именно программный код решения (Python/C++/JS), а не только конечный числовой ответ."
+        else:
+            # Асинхронная ИИ-валидация присланного кода решения через Gemini
+            is_correct, fail_reason = await check_code_with_ai(current_task["task_text"], user_ans)
     else:
         # Строгая математическая сверка числовых значений с Excel
         is_correct = is_correct_math_answer(user_ans, current_task["answer"])
@@ -897,6 +949,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info["msg_errors"] = []
             
         save_user_data(user_data)
+        # Автоматически запускаем валидацию ответа, чтобы пользователь не ждал
+        await process_check(user_id, update, context)
         return
 
     if info.get("state") == "start":
